@@ -219,7 +219,8 @@ test("llama.cpp detect: /slots array wins over OpenAI paths", async () => {
   assert.equal(probe.backendType, "llama.cpp");
 });
 
-test("llama.cpp probe: slot deltas → tok/s; props for model", async () => {
+test("llama.cpp probe: slot deltas → tok/s; props for model", async (t) => {
+  t.mock.method(Date, "now", () => 1_000_000);
   const probe = new LlmProbe({ lanIp: "10.0.0.1" }, 8080);
   probe.serverIsOpenAI = false;
   probe.backendType = "llama.cpp";
