@@ -243,9 +243,9 @@ test("llama.cpp probe: slot deltas → tok/s; props for model", async (t) => {
     }
     if (u.endsWith("/props")) {
       return jsonRes({
-        model_alias: "Qwen2.5-7B",
+        model_alias: "Qwen3.8-27B",
         model_path: "/models/qwen.gguf",
-        total_context_length: 32768,
+        default_generation_settings: { params: { n_ctx: 131072 } },
       });
     }
     if (u.includes("get_server_info") || u.endsWith("/metrics")) {
@@ -256,9 +256,9 @@ test("llama.cpp probe: slot deltas → tok/s; props for model", async (t) => {
 
   const snap = await probe.probe();
   assert.equal(snap.backend, "llama.cpp");
-  assert.equal(snap.modelId, "Qwen2.5-7B");
+  assert.equal(snap.modelId, "Qwen3.8-27B");
   assert.equal(snap.modelPath, "/models/qwen.gguf");
-  assert.equal(snap.contextLength, 32768);
+  assert.equal(snap.contextLength, 131072);
   assert.equal(snap.slotsTotal, 1);
   assert.equal(snap.slotsActive, 1);
   assert.equal(snap.generationTps, 20); // (50-10)/2

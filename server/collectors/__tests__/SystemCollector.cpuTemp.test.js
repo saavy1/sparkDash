@@ -41,3 +41,22 @@ test("rounds to one decimal", () => {
   assert.equal(parse("69250"), 69.3);
   assert.equal(parse("69240"), 69.2);
 });
+
+test("parses AMD sysfs GPU metrics with junction temperature and discrete VRAM", () => {
+  const gpu = c._parseAmdGpuLine(
+    "AMD|53000|88000|66000|97|325000000|327000000|23195131904|25753026560"
+  );
+
+  assert.equal(gpu.temperature, 88);
+  assert.equal(gpu.edgeTemperature, 53);
+  assert.equal(gpu.hotspotTemperature, 88);
+  assert.equal(gpu.memoryTemperature, 66);
+  assert.equal(gpu.usage, 97);
+  assert.deepEqual(gpu.power, { draw: 325, limit: 327, systemDraw: 345 });
+  assert.deepEqual(gpu.vram, {
+    used: 22121,
+    total: 24560,
+    percentage: 90,
+    available: 2439,
+  });
+});

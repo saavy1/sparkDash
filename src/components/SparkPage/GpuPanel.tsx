@@ -16,6 +16,12 @@ function celsiusToFahrenheit(c: number): number {
   return Math.round(c * 9 / 5 + 32);
 }
 
+function formatTemperature(celsius: number, unit: "celsius" | "fahrenheit"): string {
+  return unit === "fahrenheit"
+    ? `${celsiusToFahrenheit(celsius)}°F`
+    : `${celsius}°C`;
+}
+
 function formatMb(mb: number): string {
   if (mb >= 1024) return `${(mb / 1024).toFixed(1)} GB`;
   return `${Math.round(mb)} MB`;
@@ -47,9 +53,9 @@ export function GpuPanel({ gpu, sparkId, temperatureUnit, className }: GpuPanelP
   const tempHistory = useMetricsHistoryTail(sparkId, "gpu.temp");
   const usageHistory = useMetricsHistoryTail(sparkId, "gpu.usage");
 
-  const temperature = gpu?.temperature ?? 0;
-  const displayTemp = temperatureUnit === "fahrenheit" ? celsiusToFahrenheit(temperature) : temperature;
-  const tempLabel = temperatureUnit === "fahrenheit" ? `${displayTemp}°F` : `${displayTemp}°C`;
+  const hasAmdTemperatures = gpu?.hotspotTemperature != null;
+  const temperature = gpu?.hotspotTemperature ?? gpu?.temperature ?? 0;
+  const tempLabel = formatTemperature(temperature, temperatureUnit);
   const usage = gpu?.usage ?? 0;
   const powerDraw = gpu?.power?.draw ?? 0;
   const powerLimit = gpu?.power?.limit ?? 0;
@@ -58,8 +64,13 @@ export function GpuPanel({ gpu, sparkId, temperatureUnit, className }: GpuPanelP
   const vramTotal = gpu?.vram?.total ?? 0;
   const vramPct = gpu?.vram?.percentage ?? 0;
 
-  const tempColor =
-    temperature > 85
+  const tempColor = hasAmdTemperatures
+    ? temperature > 100
+      ? "var(--color-danger)"
+      : temperature > 90
+        ? "var(--color-warning)"
+        : "var(--color-accent)"
+    : temperature > 85
       ? "var(--color-danger)"
       : temperature > 65
         ? "var(--color-warning)"
@@ -80,11 +91,27 @@ export function GpuPanel({ gpu, sparkId, temperatureUnit, className }: GpuPanelP
         value={<span className="text-text-strong">{usage}%</span>}
       />
       <MetricRow
-        label="Temperature"
+        label={hasAmdTemperatures ? "Hotspot" : "Temperature"}
         color={tempColor}
         spark={<Sparkline data={tempHistory} color={tempColor} width={180} />}
         value={<span className="text-text-strong">{tempLabel}</span>}
       />
+      {gpu?.edgeTemperature != null && (
+        <div className="flex justify-between text-xs">
+          <span className="text-muted">GPU edge</span>
+          <span className="font-tabular text-text">
+            {formatTemperature(gpu.edgeTemperature, temperatureUnit)}
+          </span>
+        </div>
+      )}
+      {gpu?.memoryTemperature != null && (
+        <div className="flex justify-between text-xs">
+          <span className="text-muted">VRAM temperature</span>
+          <span className="font-tabular text-text">
+            {formatTemperature(gpu.memoryTemperature, temperatureUnit)}
+          </span>
+        </div>
+      )}
       <div className="flex justify-between text-sm">
         <span className="text-muted">GPU Power</span>
         <span className="font-tabular text-sm text-text">

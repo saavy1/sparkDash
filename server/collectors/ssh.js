@@ -55,6 +55,19 @@ function sshpassAvailable() {
 }
 
 /**
+ * Wrap a command so the remote login shell only has to execute a portable
+ * pipeline. The decoded payload always runs under Bash, independent of the
+ * user's configured login shell.
+ */
+export function remoteBashCommand(cmd) {
+  if (typeof cmd !== "string" || !cmd) {
+    throw new TypeError("Remote command must be a non-empty string");
+  }
+  const payload = Buffer.from(cmd, "utf8").toString("base64");
+  return `printf '%s' '${payload}' | base64 -d | bash`;
+}
+
+/**
  * Execute a command on a remote Spark via SSH.
  *
  * @param {Object} spark - Spark config object
@@ -82,6 +95,7 @@ export async function sshExec(spark, cmd, options = {}) {
   if (typeof cmd !== "string" || !cmd) {
     throw new Error("SSH command must be a non-empty string");
   }
+  const remoteCommand = remoteBashCommand(cmd);
 
   // Base SSH options (no shell metacharacters in argv)
   // accept-new: trust first-seen host key (LAN ops); pin known_hosts for stricter envs
@@ -93,8 +107,8 @@ export async function sshExec(spark, cmd, options = {}) {
   ];
 
   const remote = `${user}@${targetHost}`;
-  // Remote command as a single argument — ssh does not invoke a local shell for it
-  // when using execFile without a shell. `--` stops option parsing before destination.
+  // OpenSSH forwards one command string to the login shell. Keep that string
+  // shell-agnostic; the encoded payload itself is executed by Bash.
   let file;
   let args;
   // Minimal child env — only what ssh/sshpass actually need. Spreading the full
@@ -123,7 +137,7 @@ export async function sshExec(spark, cmd, options = {}) {
     // Password via env (sshpass -e) — never on argv or in process list as -p
     env.SSHPASS = password;
     file = "sshpass";
-    args = ["-e", "ssh", ...baseOpts, "--", remote, cmd];
+    args = ["-e", "ssh", ...baseOpts, "--", remote, remoteCommand];
   } else {
     // Key-based SSH (default) — BatchMode prevents hanging on missing keys
     file = "ssh";
@@ -132,7 +146,7 @@ export async function sshExec(spark, cmd, options = {}) {
     if (identityFile) {
       args.push("-i", identityFile);
     }
-    args.push("--", remote, cmd);
+    args.push("--", remote, remoteCommand);
   }
 
   return new Promise((resolve, reject) => {

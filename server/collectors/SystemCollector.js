@@ -29,6 +29,8 @@ export class SystemCollector {
 
     // GPU VRAM per-PID cache
     this.nvidiaComputeAppsCache = new Map();
+    // Remote GPU backend is hardware-stable; detect it once per monitor.
+    this._remoteGpuBackend = null;
 
     // Cached hardware info
     this._hardwareInfo = null;
@@ -920,85 +922,190 @@ export class SystemCollector {
   // ─── Remote collection via SSH ────────────────────────────
   async _getRemoteGpu() {
     try {
-      const cmd = [
-        "nvidia-smi --query-gpu=temperature.gpu,utilization.gpu,power.draw,power.limit,clocks.current.sm,clocks.max.sm,clocks_throttle_reasons.hw_thermal_slowdown,clocks_throttle_reasons.sw_thermal_slowdown,clocks_throttle_reasons.hw_slowdown,clocks_throttle_reasons.sw_power_cap --format=csv,noheader,nounits 2>/dev/null",
-        "echo '---'",
-        "nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null",
-        "echo '---'",
-        "nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null",
-        "echo '---'",
-        "grep -E 'MemTotal|MemAvailable' /proc/meminfo 2>/dev/null",
-      ].join("; ");
-
-      const output = await sshExec(this.spark, cmd);
-      const sections = output.split("---");
-      const gpuOut = sections[0]?.trim() || "";
-      const memFields = sections[1]?.trim() || "";
-      const computeOut = sections[2]?.trim() || "";
-      const meminfoOut = sections[3]?.trim() || "";
-
-      const gpu = this._parseGpuLine(gpuOut);
-
-      // Parse memory.used / memory.total from nvidia-smi (may be [N/A] on GB10)
-      let used = null;
-      let total = null;
-      const memLine = memFields.split("\n").filter(Boolean)[0] || "";
-      const memParts = memLine.split(",").map((s) => s.trim());
-      used = this._parseSmiNumber(memParts[0]);
-      total = this._parseSmiNumber(memParts[1]);
-
-      const apps = this._parseComputeApps(computeOut);
-      this.nvidiaComputeAppsCache.clear();
-      let computeSum = 0;
-      for (const app of apps) {
-        this.nvidiaComputeAppsCache.set(app.pid, { name: app.name, vramMB: app.vramMB });
-        computeSum += app.vramMB;
-      }
-      if ((used == null || used === 0) && computeSum > 0) used = computeSum;
-
-      // Unified-memory pool: prefer MemTotal (OS-visible) so VRAM and Unified
-      // Memory panels share the same base. Available = MemAvailable (real free).
-      const totalMatch = meminfoOut.match(/MemTotal:\s+(\d+)\s+kB/);
-      const availMatch = meminfoOut.match(/MemAvailable:\s+(\d+)\s+kB/);
-      const memTotalMB = totalMatch ? Math.round(parseInt(totalMatch[1]) / 1024) : 0;
-      let availableMB = availMatch ? Math.round(parseInt(availMatch[1]) / 1024) : 0;
-
-      const usedMB = Math.round(used || 0);
-      let totalMB = Math.round(total || 0);
-      if (this.spark.kind === "host") {
-        // Discrete GPU VRAM: trust nvidia-smi's memory.total; free VRAM = total − used.
-        if (totalMB <= 0 && memTotalMB > 0) totalMB = memTotalMB;
-        else if (totalMB <= 0) totalMB = DGX_SPARK.MEMORY_HBM_SIZE_GB * 1024; // Convert to MB
-        if (totalMB > 0 && usedMB > 0) availableMB = Math.max(0, totalMB - usedMB);
-      } else {
-        // GB10 shared HBM pool: prefer the OS-visible pool (MemTotal) as the total,
-        // fall back to nvidia-smi, then the hardware spec (HBM) only if nothing known.
-        if (memTotalMB > 0) totalMB = memTotalMB;
-        else if (totalMB <= 0) totalMB = DGX_SPARK.MEMORY_HBM_SIZE_GB * 1024; // Convert to MB
-      }
-      const percentage = totalMB > 0 ? Math.round((usedMB / totalMB) * 100) : 0;
-
-      // Rough system power estimate: GPU draw + 20W CX7/peripherals
-      const systemDraw = Math.round(gpu.powerDraw + 20);
-
-      // Top 5 GPU processes by VRAM usage
-      const processes = Array.from(this.nvidiaComputeAppsCache.entries())
-        .map(([pid, info]) => ({ pid, name: info.name, vramMB: info.vramMB }))
-        .sort((a, b) => b.vramMB - a.vramMB)
-        .slice(0, 5);
-
-      return {
-        temperature: gpu.temperature,
-        usage: gpu.usage,
-        power: { draw: gpu.powerDraw, limit: gpu.powerLimit, systemDraw },
-        vram: { used: usedMB, total: totalMB, percentage, available: availableMB },
-        processes,
-        throttle: gpu.throttle,
-      };
+      const backend = await this._getRemoteGpuBackend();
+      if (backend === "amd") return await this._getRemoteAmdGpu();
+      if (backend === "nvidia") return await this._getRemoteNvidiaGpu();
+      throw new Error("No supported remote GPU backend found");
     } catch (err) {
       console.error(`[SystemCollector] Remote GPU error for ${this.spark.id}:`, err.message);
       return this._defaultGpu();
     }
+  }
+
+  async _getRemoteGpuBackend() {
+    if (this._remoteGpuBackend) return this._remoteGpuBackend;
+    const cmd = [
+      "if command -v nvidia-smi >/dev/null 2>&1; then",
+      "  echo nvidia",
+      "elif grep -q '^0x1002$' /sys/class/drm/card*/device/vendor 2>/dev/null; then",
+      "  echo amd",
+      "else",
+      "  echo unknown",
+      "fi",
+    ].join("\n");
+    const backend = (await sshExec(this.spark, cmd)).trim();
+    if (backend !== "nvidia" && backend !== "amd") {
+      throw new Error(`Unsupported remote GPU backend: ${backend || "unknown"}`);
+    }
+    this._remoteGpuBackend = backend;
+    return backend;
+  }
+
+  async _getRemoteNvidiaGpu() {
+    const cmd = [
+      "nvidia-smi --query-gpu=temperature.gpu,utilization.gpu,power.draw,power.limit,clocks.current.sm,clocks.max.sm,clocks_throttle_reasons.hw_thermal_slowdown,clocks_throttle_reasons.sw_thermal_slowdown,clocks_throttle_reasons.hw_slowdown,clocks_throttle_reasons.sw_power_cap --format=csv,noheader,nounits 2>/dev/null",
+      "echo '---'",
+      "nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null",
+      "echo '---'",
+      "nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null",
+      "echo '---'",
+      "grep -E 'MemTotal|MemAvailable' /proc/meminfo 2>/dev/null",
+    ].join("; ");
+
+    const output = await sshExec(this.spark, cmd);
+    const sections = output.split("---");
+    const gpuOut = sections[0]?.trim() || "";
+    const memFields = sections[1]?.trim() || "";
+    const computeOut = sections[2]?.trim() || "";
+    const meminfoOut = sections[3]?.trim() || "";
+
+    const gpu = this._parseGpuLine(gpuOut);
+
+    // Parse memory.used / memory.total from nvidia-smi (may be [N/A] on GB10)
+    const memLine = memFields.split("\n").filter(Boolean)[0] || "";
+    const memParts = memLine.split(",").map((s) => s.trim());
+    let used = this._parseSmiNumber(memParts[0]);
+    let total = this._parseSmiNumber(memParts[1]);
+
+    const apps = this._parseComputeApps(computeOut);
+    this.nvidiaComputeAppsCache.clear();
+    let computeSum = 0;
+    for (const app of apps) {
+      this.nvidiaComputeAppsCache.set(app.pid, { name: app.name, vramMB: app.vramMB });
+      computeSum += app.vramMB;
+    }
+    if ((used == null || used === 0) && computeSum > 0) used = computeSum;
+
+    // Unified-memory pool: prefer MemTotal (OS-visible) so VRAM and Unified
+    // Memory panels share the same base. Available = MemAvailable (real free).
+    const totalMatch = meminfoOut.match(/MemTotal:\s+(\d+)\s+kB/);
+    const availMatch = meminfoOut.match(/MemAvailable:\s+(\d+)\s+kB/);
+    const memTotalMB = totalMatch ? Math.round(parseInt(totalMatch[1]) / 1024) : 0;
+    let availableMB = availMatch ? Math.round(parseInt(availMatch[1]) / 1024) : 0;
+
+    const usedMB = Math.round(used || 0);
+    let totalMB = Math.round(total || 0);
+    if (this.spark.kind === "host") {
+      // Discrete GPU VRAM: trust nvidia-smi's memory.total; free VRAM = total − used.
+      if (totalMB <= 0 && memTotalMB > 0) totalMB = memTotalMB;
+      else if (totalMB <= 0) totalMB = DGX_SPARK.MEMORY_HBM_SIZE_GB * 1024;
+      if (totalMB > 0 && usedMB > 0) availableMB = Math.max(0, totalMB - usedMB);
+    } else {
+      // GB10 shared HBM pool: prefer the OS-visible pool.
+      if (memTotalMB > 0) totalMB = memTotalMB;
+      else if (totalMB <= 0) totalMB = DGX_SPARK.MEMORY_HBM_SIZE_GB * 1024;
+    }
+    const percentage = totalMB > 0 ? Math.round((usedMB / totalMB) * 100) : 0;
+    const systemDraw = Math.round(gpu.powerDraw + 20);
+    const processes = Array.from(this.nvidiaComputeAppsCache.entries())
+      .map(([pid, info]) => ({ pid, name: info.name, vramMB: info.vramMB }))
+      .sort((a, b) => b.vramMB - a.vramMB)
+      .slice(0, 5);
+
+    return {
+      temperature: gpu.temperature,
+      usage: gpu.usage,
+      power: { draw: gpu.powerDraw, limit: gpu.powerLimit, systemDraw },
+      vram: { used: usedMB, total: totalMB, percentage, available: availableMB },
+      processes,
+      throttle: gpu.throttle,
+    };
+  }
+
+  async _getRemoteAmdGpu() {
+    const cmd = [
+      "set -e",
+      "best=''",
+      "best_total=0",
+      "for dev in /sys/class/drm/card*/device; do",
+      "  [ \"$(cat \"$dev/vendor\" 2>/dev/null)\" = '0x1002' ] || continue",
+      "  total=$(cat \"$dev/mem_info_vram_total\" 2>/dev/null || echo 0)",
+      "  case \"$total\" in ''|*[!0-9]*) total=0;; esac",
+      "  if [ \"$total\" -gt \"$best_total\" ]; then best=\"$dev\"; best_total=\"$total\"; fi",
+      "done",
+      "[ -n \"$best\" ]",
+      "hwmon=''",
+      "for h in \"$best\"/hwmon/hwmon*; do [ -d \"$h\" ] || continue; hwmon=\"$h\"; break; done",
+      "read_temp() {",
+      "  label=\"$1\"",
+      "  for f in \"$hwmon\"/temp*_label; do",
+      "    [ -f \"$f\" ] || continue",
+      "    if [ \"$(cat \"$f\" 2>/dev/null)\" = \"$label\" ]; then",
+      "      input=${f%_label}_input",
+      "      cat \"$input\" 2>/dev/null || echo 0",
+      "      return",
+      "    fi",
+      "  done",
+      "  echo 0",
+      "}",
+      "edge=$(read_temp edge)",
+      "junction=$(read_temp junction)",
+      "memory=$(read_temp mem)",
+      "usage=$(cat \"$best/gpu_busy_percent\" 2>/dev/null || echo 0)",
+      "power=$(cat \"$hwmon/power1_average\" 2>/dev/null || echo 0)",
+      "power_cap=$(cat \"$hwmon/power1_cap\" 2>/dev/null || echo 0)",
+      "used=$(cat \"$best/mem_info_vram_used\" 2>/dev/null || echo 0)",
+      "total=$(cat \"$best/mem_info_vram_total\" 2>/dev/null || echo 0)",
+      "printf 'AMD|%s|%s|%s|%s|%s|%s|%s|%s\\n' \"$edge\" \"$junction\" \"$memory\" \"$usage\" \"$power\" \"$power_cap\" \"$used\" \"$total\"",
+    ].join("\n");
+    return this._parseAmdGpuLine(await sshExec(this.spark, cmd));
+  }
+
+  _parseAmdGpuLine(raw) {
+    const line = String(raw)
+      .split("\n")
+      .find((entry) => entry.startsWith("AMD|"));
+    if (!line) throw new Error("AMD sysfs metrics were not reported");
+    const parts = line.split("|");
+    if (parts.length !== 9) throw new Error("Malformed AMD sysfs metrics");
+
+    const number = (value) => {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+    };
+    const celsius = (value) => Math.round((number(value) / 1000) * 10) / 10;
+    const edgeTemperature = celsius(parts[1]);
+    const hotspotTemperature = celsius(parts[2]);
+    const memoryTemperature = celsius(parts[3]);
+    const usage = Math.min(100, Math.round(number(parts[4])));
+    const draw = Math.round((number(parts[5]) / 1_000_000) * 10) / 10;
+    const limit = Math.round((number(parts[6]) / 1_000_000) * 10) / 10;
+    const used = Math.round(number(parts[7]) / 1024 / 1024);
+    const total = Math.round(number(parts[8]) / 1024 / 1024);
+    const available = Math.max(0, total - used);
+    const percentage = total > 0 ? Math.round((used / total) * 100) : 0;
+
+    return {
+      temperature: hotspotTemperature || edgeTemperature,
+      edgeTemperature,
+      hotspotTemperature,
+      memoryTemperature,
+      usage,
+      power: { draw, limit, systemDraw: Math.round(draw + 20) },
+      vram: { used, total, percentage, available },
+      processes: [],
+      throttle: {
+        thermal: false,
+        hwSlowdown: false,
+        powerCap: false,
+        active: false,
+        reason: "ok",
+        smClockMHz: null,
+        smClockMaxMHz: null,
+        smClockPct: null,
+        detail: "AMD sysfs does not expose throttle reasons",
+      },
+    };
   }
 
   async _getRemoteCpu() {
@@ -1258,10 +1365,15 @@ export class SystemCollector {
 
   async _getRemoteUnifiedMemory() {
     try {
+      const includeGpuProcesses = this.spark.kind !== "host";
       const cmd = [
         "grep -E 'MemTotal|MemAvailable' /proc/meminfo 2>/dev/null",
-        "echo '---'",
-        "nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null",
+        ...(includeGpuProcesses
+          ? [
+              "echo '---'",
+              "nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null",
+            ]
+          : []),
       ].join("; ");
 
       const output = await sshExec(this.spark, cmd);
@@ -1275,19 +1387,23 @@ export class SystemCollector {
       const availKB = availMatch ? parseInt(availMatch[1]) : 0;
       const totalMB = Math.round(totalKB / 1024);
 
-      // GPU memory from nvidia-smi compute apps (pid,process_name,used_gpu_memory)
+      // GB10 shares system memory with the GPU. Discrete-GPU hosts do not:
+      // their VRAM is already reported by the GPU panel and must not be
+      // subtracted from system RAM.
       let gpuUsedMB = 0;
-      const computeApps = computeOut.trim().split("\n").filter(Boolean);
-      for (const line of computeApps) {
-        const parts = line.split(",").map((s) => s.trim());
-        const vramMB = parseFloat(parts[2]) || 0;
-        gpuUsedMB += vramMB;
+      if (includeGpuProcesses) {
+        const computeApps = computeOut.trim().split("\n").filter(Boolean);
+        for (const line of computeApps) {
+          const parts = line.split(",").map((s) => s.trim());
+          gpuUsedMB += parseFloat(parts[2]) || 0;
+        }
+        gpuUsedMB = Math.round(gpuUsedMB);
       }
-      gpuUsedMB = Math.round(gpuUsedMB);
 
-      // CPU memory = total - available - GPU
       const systemUsedKB = totalKB - availKB;
-      const cpuUsedKB = Math.max(0, systemUsedKB - (gpuUsedMB * 1024));
+      const cpuUsedKB = includeGpuProcesses
+        ? Math.max(0, systemUsedKB - (gpuUsedMB * 1024))
+        : Math.max(0, systemUsedKB);
       const cpuUsedMB = Math.round(cpuUsedKB / 1024);
 
       const usedMB = gpuUsedMB + cpuUsedMB;
@@ -1302,7 +1418,7 @@ export class SystemCollector {
         available: Math.round(availKB / 1024),
         percentage,
         oomRisk,
-        bandwidth: { current: 0, peak: 400 },
+        bandwidth: { current: 0, peak: includeGpuProcesses ? 400 : 0 },
       };
     } catch (err) {
       console.error(`[SystemCollector] Remote Unified Memory error for ${this.spark.id}:`, err.message);

@@ -193,6 +193,12 @@ export interface GpuThrottle {
 
 export interface GpuMetrics {
   temperature: number;
+  /** AMD edge sensor temperature. Present on AMD GPUs. */
+  edgeTemperature?: number;
+  /** AMD junction/hotspot temperature. Present on AMD GPUs. */
+  hotspotTemperature?: number;
+  /** AMD VRAM temperature. Present when the board exposes it. */
+  memoryTemperature?: number;
   usage: number;
   power: {
     draw: number;

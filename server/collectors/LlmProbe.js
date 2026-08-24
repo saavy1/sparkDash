@@ -1021,7 +1021,11 @@ export class LlmProbe {
           this.modelPath = null;
         }
         if (raw) this.modelId = normalizeModelId(raw);
-        this.contextLength = props.total_context_length || props.context_length || this.contextLength;
+        this.contextLength =
+          props.total_context_length ||
+          props.context_length ||
+          props.default_generation_settings?.params?.n_ctx ||
+          this.contextLength;
       }
     } catch {}
 
