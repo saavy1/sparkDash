@@ -1120,7 +1120,7 @@ export class SystemCollector {
               // Same hwmon-then-thermal priority as local `_getCPUTemperature()`.
               // GB10 also exposes nvme/mlx5 sensors; the name allowlist keeps those out.
               'for h in /sys/class/hwmon/*; do n=$(cat "$h/name" 2>/dev/null); case "$n" in coretemp|k10temp|zenpower|acpitz) for t in "$h"/temp*_input; do cat "$t" 2>/dev/null; break; done;; esac; done',
-              "cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null",
+              "cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null || true",
             ]
           : []),
       ].join("; ");
