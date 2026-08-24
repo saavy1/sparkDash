@@ -1024,7 +1024,7 @@ export class LlmProbe {
         this.contextLength =
           props.total_context_length ||
           props.context_length ||
-          props.default_generation_settings?.params?.n_ctx ||
+          props.default_generation_settings?.n_ctx ||
           this.contextLength;
       }
     } catch {}

@@ -245,7 +245,7 @@ test("llama.cpp probe: slot deltas → tok/s; props for model", async (t) => {
       return jsonRes({
         model_alias: "Qwen3.8-27B",
         model_path: "/models/qwen.gguf",
-        default_generation_settings: { params: { n_ctx: 131072 } },
+        default_generation_settings: { n_ctx: 131072 },
       });
     }
     if (u.includes("get_server_info") || u.endsWith("/metrics")) {
